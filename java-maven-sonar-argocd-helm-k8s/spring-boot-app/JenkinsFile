@@ -3,219 +3,107 @@ pipeline {
     docker {
       // এটি Jenkins-এর build-tools image, application image নয়।
       image 'abhishekf5/maven-abhishek-docker-agent:v1'
-
-      // EC2-র Docker engine ও স্থানীয় SonarQube ব্যবহারের জন্য।
-      args '--user root --network host -v /var/run/docker.sock:/var/run/docker.sock'
+      args '--user root -v /var/run/docker.sock:/var/run/docker.sock'
     }
-  }
-
-  options {
-    // Checkout stage-এ আমরা নিজেই source code নামাব।
-    skipDefaultCheckout(true)
-    disableConcurrentBuilds()
-    timestamps()
-  }
-
-  environment {
-    APP_DIR = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app'
-    MANIFEST_FILE = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml'
-    SONAR_PROJECT_KEY = 'spring-boot-app'
-    DOCKER_IMAGE = 'imsameur/spring-boot-app'
-    SKIP_PIPELINE = 'false'
   }
 
   stages {
     stage('Checkout') {
       steps {
+        sh 'echo Checkout Starting'
+
         git branch: 'main',
             url: 'https://github.com/Sameurxd/Jenkins-Zero-To-Hero.git'
-
-        script {
-          // Jenkins-এর manifest commit আবার pipeline loop তৈরি না করুক।
-          def subject = sh(
-            script: 'git log -1 --pretty=%s',
-            returnStdout: true
-          ).trim()
-
-          env.SKIP_PIPELINE = subject.startsWith('[skip ci]') ? 'true' : 'false'
-        }
-
-        sh '''
-          set -eu
-
-          test -f "$APP_DIR/pom.xml" || {
-            echo "pom.xml পাওয়া যায়নি: $APP_DIR"
-            exit 1
-          }
-
-          test -f "$APP_DIR/Dockerfile" || {
-            echo "Dockerfile পাওয়া যায়নি: $APP_DIR"
-            exit 1
-          }
-        '''
       }
     }
 
     stage('Build and Test') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
-      }
-
       steps {
-        dir("${env.APP_DIR}") {
-          sh 'mvn -B clean verify'
-        }
-      }
+        sh 'ls -ltr'
 
-      post {
-        always {
-          junit(
-            testResults: "${env.APP_DIR}/target/surefire-reports/*.xml",
-            allowEmptyResults: true
-          )
-        }
+        sh 'cd java-maven-sonar-argocd-helm-k8s/spring-boot-app && mvn -B clean package'
       }
     }
 
     stage('Static Code Analysis') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
+      environment {
+        SONAR_URL = 'http://47.129.31.72:9000'
       }
 
       steps {
-        dir("${env.APP_DIR}") {
-          withSonarQubeEnv('local-sonarqube') {
-            sh 'mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.2.0.4988:sonar -Dsonar.projectKey="$SONAR_PROJECT_KEY"'
-          }
-        }
-      }
-    }
+        withCredentials([
+          string(
+            credentialsId: 'sonarqube-local-token',
+            variable: 'SONAR_AUTH_TOKEN'
+          )
+        ]) {
+          sh '''
+            cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
 
-    stage('Quality Gate') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
-      }
-
-      steps {
-        timeout(time: 10, unit: 'MINUTES') {
-          waitForQualityGate(abortPipeline: true)
+            mvn -B org.sonarsource.scanner.maven:sonar-maven-plugin:5.2.0.4988:sonar \
+              -Dsonar.token="$SONAR_AUTH_TOKEN" \
+              -Dsonar.host.url="$SONAR_URL" \
+              -Dsonar.projectKey=spring-boot-app
+          '''
         }
       }
     }
 
     stage('Build and Push Docker Image') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
+      environment {
+        DOCKER_IMAGE = "sameurxd/spring-boot-app:${BUILD_NUMBER}"
       }
 
       steps {
-        dir("${env.APP_DIR}") {
-          sh 'docker build -t "${DOCKER_IMAGE}:${BUILD_NUMBER}" .'
-        }
-
         script {
-          def imageName = "${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}"
+          sh '''
+            cd java-maven-sonar-argocd-helm-k8s/spring-boot-app
+            docker build -t "$DOCKER_IMAGE" .
+          '''
+
+          def dockerImage = docker.image("${DOCKER_IMAGE}")
 
           docker.withRegistry(
             'https://index.docker.io/v1/',
             'docker-cred'
           ) {
-            docker.image(imageName).push()
+            dockerImage.push()
           }
         }
       }
     }
 
     stage('Update Deployment File') {
-      when {
-        expression { env.SKIP_PIPELINE != 'true' }
+      environment {
+        GIT_REPO_NAME = 'Jenkins-Zero-To-Hero'
+        GIT_USER_NAME = 'Sameurxd'
+        DOCKER_IMAGE = "sameurxd/spring-boot-app:${BUILD_NUMBER}"
+        MANIFEST_FILE = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml'
       }
 
       steps {
         withCredentials([
-          string(credentialsId: 'github', variable: 'GITHUB_TOKEN')
+          string(
+            credentialsId: 'github',
+            variable: 'GITHUB_TOKEN'
+          )
         ]) {
           sh '''
             set +x
-            set -eu
+            set -e
 
-            if [ ! -f "$MANIFEST_FILE" ]; then
-              echo "Deployment file পাওয়া যায়নি: $MANIFEST_FILE"
-              exit 1
-            fi
-
-            IMAGE_COUNT="$(grep -Ec '^[[:space:]]*image:[[:space:]]*[^[:space:]]+' "$MANIFEST_FILE" || true)"
-
-            if [ "$IMAGE_COUNT" -ne 1 ]; then
-              echo "Deployment file-এ ঠিক একটি image লাইন থাকার কথা; পাওয়া গেছে: $IMAGE_COUNT"
-              grep -n 'image:' "$MANIFEST_FILE" || true
-              exit 1
-            fi
-
-            awk -v new_image="${DOCKER_IMAGE}:${BUILD_NUMBER}" '
-              /^[[:space:]]*image:[[:space:]]*/ {
-                sub(/image:.*/, "image: " new_image)
-                count++
-              }
-              { print }
-              END {
-                if (count != 1) exit 2
-              }
-            ' "$MANIFEST_FILE" > "${MANIFEST_FILE}.tmp"
-
-            mv "${MANIFEST_FILE}.tmp" "$MANIFEST_FILE"
-
-            git diff --check
-            git diff -- "$MANIFEST_FILE"
-
-            git config user.name "Jenkins CI"
             git config user.email "jenkins@users.noreply.github.com"
+            git config user.name "$GIT_USER_NAME"
+
+            sed -i -E "s|(^[[:space:]]*image:[[:space:]]*).*|\\1${DOCKER_IMAGE}|" "$MANIFEST_FILE"
 
             git add "$MANIFEST_FILE"
+            git commit -m "Update deployment image to version ${BUILD_NUMBER}"
 
-            if git diff --cached --quiet; then
-              echo "Deployment file-এ নতুন পরিবর্তন নেই।"
-              exit 0
-            fi
-
-            git commit -m "[skip ci] Update deployment image to ${BUILD_NUMBER}"
-
-            ASKPASS_FILE="$(mktemp)"
-            trap 'rm -f "$ASKPASS_FILE"' EXIT
-
-            cat > "$ASKPASS_FILE" <<'EOF'
-#!/bin/sh
-case "$1" in
-  *Username*) printf '%s\\n' 'Sameurxd' ;;
-  *Password*) printf '%s\\n' "$GITHUB_TOKEN" ;;
-  *) exit 1 ;;
-esac
-EOF
-
-            chmod 700 "$ASKPASS_FILE"
-            export GIT_ASKPASS="$ASKPASS_FILE"
-            export GIT_TERMINAL_PROMPT=0
-
-            git -c credential.helper= push origin HEAD:main
+            git push "https://${GITHUB_TOKEN}@github.com/${GIT_USER_NAME}/${GIT_REPO_NAME}.git" HEAD:main
           '''
         }
       }
-    }
-  }
-
-  post {
-    success {
-      script {
-        if (env.SKIP_PIPELINE == 'true') {
-          echo 'Jenkins-এর deployment commit শনাক্ত হয়েছে; build stage-গুলো এড়ানো হয়েছে।'
-        } else {
-          echo "Pipeline সফল। Docker Hub image: ${env.DOCKER_IMAGE}:${env.BUILD_NUMBER}"
-        }
-      }
-    }
-
-    failure {
-      echo 'Pipeline ব্যর্থ হয়েছে। Jenkins log-এ ব্যর্থ stage পরীক্ষা করো।'
     }
   }
 }
