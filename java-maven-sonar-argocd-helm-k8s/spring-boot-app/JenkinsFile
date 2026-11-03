@@ -51,7 +51,7 @@ pipeline {
 
     stage('Build and Push Docker Image') {
       environment {
-        DOCKER_IMAGE = "sameurxd/spring-boot-app:${BUILD_NUMBER}"
+        DOCKER_IMAGE = "imsameur/spring-boot-app:${BUILD_NUMBER}"
       }
 
       steps {
@@ -77,7 +77,7 @@ pipeline {
       environment {
         GIT_REPO_NAME = 'Jenkins-Zero-To-Hero'
         GIT_USER_NAME = 'Sameurxd'
-        DOCKER_IMAGE = "sameurxd/spring-boot-app:${BUILD_NUMBER}"
+        DOCKER_IMAGE = "imsameur/spring-boot-app:${BUILD_NUMBER}"
         MANIFEST_FILE = 'java-maven-sonar-argocd-helm-k8s/spring-boot-app-manifests/deployment.yml'
       }
 
