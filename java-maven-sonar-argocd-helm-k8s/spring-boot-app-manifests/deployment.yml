@@ -16,6 +16,6 @@ spec:
     spec:
       containers:
       - name: spring-boot-app
-        image: imsameur/spring-boot-app:9
+        image: imsameur/spring-boot-app:12
         ports:
         - containerPort: 8080
